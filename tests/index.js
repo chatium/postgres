@@ -3,6 +3,7 @@
 const { t, not, ot } = require('./test.js') // eslint-disable-line
 const cp = require('child_process')
 const path = require('path')
+const net = require('net')
 
 /** @type {import('../types')} */
 const postgres = require('../lib')
@@ -47,7 +48,7 @@ t('Connects with no options', async() => {
   const sql = postgres()
 
   const result = (await sql`select 1 as x`)[0].x
-  sql.end()
+  await sql.end()
 
   return [1, result]
 })
@@ -990,6 +991,7 @@ t('connect_timeout works', async() => {
       throw e
     end = Date.now()
   })
+  server.close()
   return [connect_timeout, Math.floor((end - start) / 100) / 10]
 })
 
@@ -1065,13 +1067,37 @@ t('Insert array in sql()', async() => {
 })
 
 t('Automatically creates prepared statements', async() => {
-  const sql = postgres({ no_prepare: false })
+  const sql = postgres({ ...options, no_prepare: false })
   const result = await sql`select * from pg_prepared_statements`
   return [result[0].statement, 'select * from pg_prepared_statements']
 })
 
 t('no_prepare: true disables prepared transactions', async() => {
-  const sql = postgres({ no_prepare: true })
+  const sql = postgres({ ...options, no_prepare: true })
   const result = await sql`select * from pg_prepared_statements`
   return [0, result.count]
 })
+
+t('Catches connection config errors', async() => {
+  const sql = postgres({ ...options, user: { toString: () => { throw new Error('wat') } }, database: 'prut' })
+
+  return [
+    'wat',
+    await sql`select 1`.catch((e) => e.message)
+  ]
+})
+
+t('Catches connection config errors with end', async() => {
+  const sql = postgres({ ...options, user: { toString: () => { throw new Error('wat') } }, database: 'prut' })
+
+  return [
+    'wat',
+    await sql`select 1`.catch((e) => e.message),
+    await sql.end()
+  ]
+})
+
+t('Catches query format errors', async() => [
+  'wat',
+  await sql.unsafe({ toString: () => { throw new Error('wat') } }).catch((e) => e.message)
+])

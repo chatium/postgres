@@ -4,7 +4,7 @@
 - 🚯 1250 LOC - 0 dependencies
 - 🏷 ES6 Tagged Template Strings at the core
 - 🏄‍♀️ Simple surface API
-- 💬 Chat on [Gitter](https://badges.gitter.im/porsager/postgres.svg)
+- 💬 Chat on [Gitter](https://gitter.im/porsager/postgres)
 
 <br>
 
@@ -33,10 +33,10 @@ module.exports = sql
 // other.js
 const sql = require('./db.js')
 
-await sql`
+const users = await sql`
   select name, age from users
 `
-// > [{ name: 'Murray', age: 68 }, { name: 'Walter', age 78 }]
+// users: [{ name: 'Murray', age: 68 }, { name: 'Walter', age: 78 }]
 ```
 
 ## Connection options `postgres([url], [options])`
@@ -440,7 +440,7 @@ sql.begin(async sql => {
 
   return [user, account]
 })
-.then(([user, account])) => {
+.then(([user, account]) => {
   // great success - COMMIT succeeded
 })
 .catch(() => {
