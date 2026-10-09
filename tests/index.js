@@ -848,6 +848,138 @@ t('Cursor throw works', async() => {
   return ['1aerr', order.join('')]
 })
 
+// With max: 1, a plain query issued while a transaction is open must wait for the commit. If the
+// pool held the transaction's connection (or held it twice), the query would run inside it.
+async function queryLeaksIntoTransaction(sql) {
+  let leaked
+  await sql.begin(async tx => {
+    await tx`set local application_name = 'in_tx'`
+    leaked = sql`select current_setting('application_name') as x`
+    await delay(20)
+  })
+  return (await leaked)[0].x === 'in_tx'
+}
+
+t('Cursor inside begin() completes and the connection is returned once', async() => {
+  const sql = postgres({ ...options, max: 1 })
+  const sizes = []
+  await sql.begin(async tx => {
+    await tx`select * from generate_series(1, 5)`.cursor(2, rows => { sizes.push(rows.length) })
+  })
+  const leaks = await queryLeaksIntoTransaction(sql)
+  await sql.end()
+  return ['2,2,1,false', sizes.concat(leaks).join()]
+})
+
+t('Cursor END inside begin() returns the connection once', async() => {
+  const sql = postgres({ ...options, max: 1 })
+  let calls = 0
+  await sql.begin(async tx => {
+    await tx`select * from generate_series(1, 10)`.cursor(2, () => (calls++, tx.END))
+  })
+  const leaks = await queryLeaksIntoTransaction(sql)
+  await sql.end()
+  return ['1,false', [calls, leaks].join()]
+})
+
+t('Cursor END outside a transaction returns the connection once', async() => {
+  const sql = postgres({ ...options, max: 1 })
+  let calls = 0
+  await sql`select * from generate_series(1, 10)`.cursor(2, () => (calls++, sql.END))
+  const leaks = await queryLeaksIntoTransaction(sql)
+  await sql.end()
+  return ['1,false', [calls, leaks].join()]
+})
+
+t('Cursor inside begin() does not hand the connection to a competing query', async() => {
+  const sql = postgres({ ...options, max: 1 })
+  const order = []
+  let competing
+  await sql.begin(async tx => {
+    await tx`set local application_name = 'in_tx'`
+    await tx`select * from generate_series(1, 4)`.cursor(2, () => { /* noop */ })
+    competing = sql`select current_setting('application_name') as x`
+      .then(([{ x }]) => (order.push('competing'), x))
+    await delay(20)
+    order.push('commit')
+  })
+  const x = await competing
+  await sql.end()
+  return ['commit,competing,postgres.js', order.concat(x).join()]
+})
+
+t('Competing query waits for a cursor outside a transaction and then runs', async() => {
+  const sql = postgres({ ...options, max: 1 })
+  const order = []
+  let competing
+  await sql`select * from generate_series(1, 4)`.cursor(2, async() => {
+    competing = competing || sql`select 1`.then(() => order.push('competing'))
+    await delay(10)
+    order.push('batch')
+  })
+  await competing
+  await sql.end()
+  return ['batch,batch,competing', order.join()]
+})
+
+t('Cursor statement timeout inside begin() rejects with 57014 and the connection is reusable', async() => {
+  const sql = postgres({ ...options, max: 1 })
+  let batches = 0
+  const started = Date.now()
+  const err = await sql.begin(async tx => {
+    await tx`set local statement_timeout = 100`
+    await tx`select pg_sleep(0.01) from generate_series(1, 100)`.cursor(5, () => { batches++ })
+  }).catch(e => e)
+  const elapsed = Date.now() - started
+  const [{ x }] = await sql`select 1 as x`
+  await sql.end()
+  return ['57014,true,true,1', [err.code, batches > 0, elapsed < 400, x].join()]
+})
+
+t('Cursor statement timeout outside a transaction rejects with 57014 and the connection is reusable', async() => {
+  const sql = postgres({ ...options, max: 1, connection: { statement_timeout: 100 } })
+  const err = await sql`select pg_sleep(0.01) from generate_series(1, 100)`.cursor(5, () => { /* noop */ })
+    .catch(e => e)
+  const [{ x }] = await sql`select 1 as x`
+  await sql.end()
+  return ['57014,1', [err.code, x].join()]
+})
+
+t('Cursor error before the first batch rejects', async() => {
+  const sql = postgres({ ...options, max: 1 })
+  const err = await sql`select 1/0 as x from generate_series(1, 4)`.cursor(2, () => { /* noop */ })
+    .catch(e => e)
+  const [{ x }] = await sql`select 1 as x`
+  await sql.end()
+  return ['22012,1', [err.code, x].join()]
+})
+
+t('Cursor callback throw closes the portal and the transaction stays usable', async() => {
+  const sql = postgres({ ...options, max: 1 })
+  let calls = 0
+  const result = await sql.begin(async tx => {
+    const err = await tx`select * from generate_series(1, 10)`.cursor(2, () => {
+      calls++
+      throw new Error('boom')
+    }).catch(e => e)
+    const [{ x }] = await tx`select 42 as x`
+    return err.message + x
+  })
+  const leaks = await queryLeaksIntoTransaction(sql)
+  await sql.end()
+  return ['boom42,1,false', [result, calls, leaks].join()]
+})
+
+t('Cursor callback throw on the last batch rejects with the thrown error', async() => {
+  const sql = postgres({ ...options, max: 1 })
+  const err = await sql`select * from generate_series(1, 3)`.cursor(5, () => {
+    throw new Error('last')
+  }).catch(e => e)
+  const [{ x }] = await sql`select 1 as x`
+  await sql.end()
+  return ['last,1', [err.message, x].join()]
+})
+
 t('Transform row', async() => {
   const sql = postgres({
     ...options,
