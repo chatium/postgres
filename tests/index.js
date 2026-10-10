@@ -1101,30 +1101,65 @@ t('Uncached sql.file() cursor with an invalid batch size rejects at once inside 
   return ['INVALID_CURSOR_ROWS,INVALID_CURSOR_ROWS,2,false', [...codes, y, sent.includes('select 1 as x')].join()]
 })
 
-t('Queued cursor rejected for its batch size is discarded and the queries behind it run', async() => {
-  const sql = postgres({ ...options, max: 1 })
+t('Queued queries failing to parse are rejected, a cancelled one is never parsed, the ones behind run', async() => {
+  // every value passed through sql.types.probe() is recorded when its query is parsed
+  const serialized = []
+  const sql = postgres({ ...options, max: 1, types: { probe: { to: 1043, from: [], serialize: x => {
+    serialized.push(x)
+    if (x === 'throw')
+      throw new Error('serializer')
+    return x
+  } } } })
   const unhandled = []
   const onunhandled = e => unhandled.push(e && e.code)
   process.on('unhandledRejection', onunhandled)
   try {
     let queued
     const code = await sql.begin(async() => {
-      // the transaction holds the only connection: all of these wait in the pool queue, and the ones
-      // with an undefined value fail to parse only when they leave it
-      const code = await sql`select ${ undefined }`.cursor(0, () => { /* noop */ }).catch(e => e.code)
+      // the transaction holds the only connection: all of these wait in the pool queue and are parsed
+      // only when they leave it, so the undefined value and the throwing serializer fail only then
+      const code = await sql`select ${ sql.types.probe('cancelled') }`.cursor(0, () => { /* noop */ })
+        .catch(e => e.code)
       queued = Promise.all([
+        // a valid cursor holds its connection before it is parsed: its parse failure must return it
+        sql`select ${ sql.types.probe('throw') } as x`.cursor(() => { /* noop */ }).catch(e => e.message),
         sql`select ${ undefined } as x`.catch(e => e.code),
-        sql`select 1 as x`.then(([{ x }]) => x)
+        sql`select ${ sql.types.probe('ok') }::text as x`.then(([{ x }]) => x)
       ])
       return code
     })
     const results = await queued
     await delay(10)
+    const leaks = await queryLeaksIntoTransaction(sql)
     await sql.end()
-    return ['INVALID_CURSOR_ROWS,UNDEFINED_VALUE,1,', [code, ...results, unhandled.join()].join()]
+    return [
+      'INVALID_CURSOR_ROWS,serializer,UNDEFINED_VALUE,ok,throw|ok,,false',
+      [code, ...results, serialized.join('|'), unhandled.join(), leaks].join()
+    ]
   } finally {
     process.removeListener('unhandledRejection', onunhandled)
   }
+})
+
+t('Queued cursor whose serializer starts a transaction does not run inside it', async() => {
+  let begun
+  const sql = postgres({ ...options, max: 1, types: { probe: { to: 1043, from: [], serialize: fn => fn() } } })
+  let cursorXid
+    , queued
+  await sql`select 1`.cursor(async() => {
+    // the cursor holds the only connection: this one waits in the pool queue and is parsed (its
+    // serializer starting a transaction) only when it leaves it, onto the connection given to it
+    queued = sql`select txid_current()::text as id, ${ sql.types.probe(() => {
+      // the delay lets an outside cursor sent into this transaction finish before it is used here
+      begun = sql.begin(tx => delay(20).then(() => tx`select txid_current()::text as id`))
+      return 'probe'
+    }) }::text as x`.cursor(({ id }) => { cursorXid = id })
+    await delay(5)
+  })
+  await queued
+  const [{ id: txXid }] = await begun
+  await sql.end()
+  return ['false', String(cursorXid === txXid)]
 })
 
 t('Cursor server error inside a savepoint rolls back to it and the transaction continues', async() => {
@@ -1200,33 +1235,51 @@ t('Cursor server error while the callback is pending sends one Sync and the call
   const sql = postgres({ host: '127.0.0.1', port: server.port, max: 1, onnotice: x => notices.push(x.message) })
   try {
     const results = []
-    for (const outcome of ['fulfil', 'reject', 'end']) {
-      let called
-        , finish
-      const pending = new Promise(r => called = r)
-      const gate = new Promise(r => finish = r)
-      const cursor = sql`select x`.cursor(async() => {
-        called()
-        await gate
-        if (outcome === 'reject')
-          throw new Error('late')
-        return outcome === 'end' ? sql.END : undefined
-      }).catch(e => e.code)
-      await pending
-      const connection = server.last()
-          , mark = connection.received.length
-      // ErrorResponse, then a NoticeResponse and a NotificationResponse; ReadyForQuery only after Sync
-      server.error()
-      results.push(await cursor)
-      finish()
-      await delay(5)
-      const rows = await sql`select x as ${ sql(outcome) }`
-      // nothing between the cursor's single Sync and the next query's messages
-      results.push(/^SP?BDEHS$/.test(connection.received.slice(mark).join('')), rows.length)
+    // the callback continues either between the ErrorResponse and the withheld ReadyForQuery, with a
+    // second ErrorResponse arriving in between too, or once the cursor has settled
+    for (const early of [true, false]) {
+      for (const outcome of ['fulfil', 'reject', 'end']) {
+        let called
+          , finish
+          , settled = false
+        const pending = new Promise(r => called = r)
+        const gate = new Promise(r => finish = r)
+        const cursor = sql`select x`.cursor(async() => {
+          called()
+          await gate
+          if (outcome === 'reject')
+            throw new Error('late')
+          return outcome === 'end' ? sql.END : undefined
+        }).catch(e => (settled = true, e.code))
+        await pending
+        const connection = server.last()
+            , mark = connection.received.length
+        server.hold = early
+        // ErrorResponse, then a NoticeResponse and a NotificationResponse; ReadyForQuery only after Sync
+        server.error()
+        if (early) {
+          // the cursor's Sync arrived and its ReadyForQuery is withheld
+          await server.when(() => server.held.length)
+          finish()
+          await delay(5)
+          server.errorAgain()
+          await delay(5)
+          results.push(settled, connection.received.slice(mark).join(''))
+          server.release()
+        }
+        results.push(await cursor)
+        if (!early) {
+          finish()
+          await delay(5)
+        }
+        const rows = await sql`select x as ${ sql(outcome + early) }`
+        // nothing between the cursor's single Sync and the next query's messages
+        results.push(/^SP?BDEHS$/.test(connection.received.slice(mark).join('')), rows.length)
+      }
     }
     return [
-      '57014,true,3,57014,true,3,57014,true,3,fake notice,fake notice,fake notice',
-      results.concat(notices).join()
+      'false,S,57014,true,3,false,S,57014,true,3,false,S,57014,true,3,57014,true,3,57014,true,3,57014,true,3,9',
+      results.concat(notices.filter(x => x === 'fake notice').length).join()
     ]
   } finally {
     sql.end({ timeout: 0 })
@@ -1287,12 +1340,47 @@ t('Socket close while a cursor callback is pending writes nothing into the repla
   }
 })
 
+t('Cursor registered again once it was sent is rejected on its own and the running cursor completes', async() => {
+  const server = await fakeServer()
+  const sql = postgres({ host: '127.0.0.1', port: server.port, max: 1 })
+  try {
+    let called
+      , finish
+    const pending = new Promise(r => called = r)
+    const gate = new Promise(r => finish = r)
+    const rows = []
+    const query = sql`select x`
+    const cursor = query.cursor(async({ x }) => (rows.push(x), called(), await gate))
+      .then(() => 'done', e => e.code)
+    await pending
+    // the cursor holds the only connection: this waits in the pool queue until the cursor ends
+    const following = sql`select x as following`
+    // too late to change: neither may settle the running cursor, release its connection or replace its callback
+    const late = await Promise.all([
+      query.cursor(0, () => { /* noop */ }),
+      query.cursor(2, () => rows.push('late'))
+    ].map(x => x.catch(e => e.code)))
+    await delay(5)
+    finish()
+    const outcome = await cursor
+    const result = await following
+    return [
+      'CURSOR_AFTER_SEND,CURSOR_AFTER_SEND,done,1,2,3,3',
+      late.concat(outcome, rows, result.length).join()
+    ]
+  } finally {
+    sql.end({ timeout: 0 })
+    server.close()
+  }
+})
+
 // A fake server speaking just enough of the protocol to script a cursor at exact points: every query
 // yields one int4 column `x` with the rows 1, 2, 3 (none for the array types lookup). Like PostgreSQL,
 // after an ErrorResponse (`error()` while a cursor waits, or `errorOnClose` in place of CloseComplete)
-// it skips every message up to the next Sync. With `hold` set, the ReadyForQuery answering a query's
-// Sync is withheld until `release()`. Each connection lists the message types it got in `received`;
-// `when(fn)` resolves once fn() is true, checked after every message.
+// it skips every message up to the next Sync; `errorAgain()` just sends one more ErrorResponse. With
+// `hold` set, the ReadyForQuery answering a query's Sync is withheld until `release()`. Each connection
+// lists the message types it got in `received`; `when(fn)` resolves once fn() is true, checked after
+// every message.
 function fakeServer() {
   const msg = (type, ...parts) => {
     const body = Buffer.concat(parts.map(x => typeof x === 'string' ? Buffer.from(x) : x))
@@ -1321,6 +1409,7 @@ function fakeServer() {
     errorOnClose: false,
     last: () => fake.connections[fake.connections.length - 1],
     error: () => fail(fake.last()),
+    errorAgain: () => fake.last().socket.write(failure),
     drop: () => fake.last().socket.destroy(),
     release,
     when,

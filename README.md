@@ -194,6 +194,8 @@ If an error is thrown inside the callback function no more rows will be requeste
 
 A server error received while the cursor is open (for example a `statement_timeout`, which counts the whole cursor as one statement) rejects the promise with that error instead of leaving it pending: no more rows are requested, also when it arrives while the callback is still running. A cursor inside `sql.begin()` runs on the transaction's connection, which is returned to the pool only when the transaction ends; a cursor outside a transaction holds its connection from the moment it is sent (also when it first waited for a free connection) until it ends and then lets the queries queued behind it run. When the connection fails (closed, destroyed, timed out) the promise rejects and a callback still running sends nothing more.
 
+Call `.cursor()` right away, before the query is sent (in the same tick as creating it). Once the query is sent, any `.cursor()` call on it (a first or a repeated one, valid or not) returns a separate promise rejected with `CURSOR_AFTER_SEND` and leaves the running query, its callback and its connection untouched.
+
 You can also stop receiving any more rows early by returning an end token `sql.END` from the callback function.
 
 ```js
