@@ -980,6 +980,201 @@ t('Cursor callback throw on the last batch rejects with the thrown error', async
   return ['last,1', [err.message, x].join()]
 })
 
+t('Cursor callback rejection with any value rejects with exactly that value', async() => {
+  const sql = postgres({ ...options, max: 1 })
+  const values = [undefined, null, false, 0, '', 'boom', Object.freeze(new Error('frozen'))]
+  const results = []
+  for (const value of values) {
+    results.push(await sql`select * from generate_series(1, 3)`.cursor(() => { throw value }).then(
+      () => 'resolved',
+      e => e === value ? 'same' : 'other'
+    ))
+  }
+  const [{ x }] = await sql`select 1 as x`
+  await sql.end()
+  return ['same,same,same,same,same,same,same,1', results.concat(x).join()]
+})
+
+t('Cursor with an invalid batch size rejects at once and sends nothing', async() => {
+  const sent = []
+  const sql = postgres({ ...options, max: 1, debug: (id, str) => sent.push(str) })
+  // the transaction holds the only connection: a query that had to be sent would wait for it forever
+  const codes = await sql.begin(async() => {
+    const codes = []
+    for (const rows of [0, -1, 1.5, 2 ** 31, '2'])
+      codes.push(await sql`select 'invalid' as x`.cursor(rows, () => { /* noop */ }).catch(e => e.code))
+    return codes
+  })
+  const [{ x }] = await sql`select 1 as x`
+  await sql.end()
+  return [
+    'INVALID_CURSOR_ROWS,INVALID_CURSOR_ROWS,INVALID_CURSOR_ROWS,INVALID_CURSOR_ROWS,INVALID_CURSOR_ROWS,1,false',
+    codes.concat(x, sent.some(x => x.includes('invalid'))).join()
+  ]
+})
+
+t('Cursor queued for a busy pool runs alone on its connection', async() => {
+  const sql = postgres({ ...options, max: 1 })
+  const order = []
+  let queued
+  await sql`select * from generate_series(1, 2) as x`.cursor(async({ x }) => {
+    // the only connection is held by this cursor: both wait in the pool queue
+    queued = queued || Promise.all([
+      sql`select * from generate_series(1, 3) as x`.cursor(async({ x }) => (await delay(5), order.push('b' + x))),
+      sql`select 'q' as x`.then(([{ x }]) => order.push(x))
+    ])
+    await delay(5)
+    order.push('a' + x)
+  })
+  await queued
+  await sql.end()
+  return ['a1,a2,b1,b2,b3,q', order.join()]
+})
+
+t('Uncached sql.file() cursor holds its connection until it ends', async() => {
+  const sql = postgres({ ...options, max: 1 })
+  const order = []
+  let competing
+  await sql.file(path.join(__dirname, 'select-param.sql'), ['1']).cursor(async() => {
+    competing = sql`select 2 as y`.then(([{ y }]) => (order.push('competing'), y))
+    await delay(10)
+    order.push('batch')
+  })
+  const y = await competing
+  await sql.end()
+  return ['batch,competing,2', order.concat(y).join()]
+})
+
+t('Query waiting for a cursor\'s connection is rejected once sql.end() has started', async() => {
+  const sql = postgres({ ...options, max: 1 })
+  let waiting
+    , ending
+  await sql`select * from generate_series(1, 2)`.cursor(async() => {
+    if (!waiting) {
+      waiting = sql`select 1`.catch(e => e.code)
+      ending = sql.end()
+    }
+    await delay(5)
+  })
+  return ['CONNECTION_ENDED', await waiting, await ending]
+})
+
+t('Socket close while a cursor callback is pending writes nothing afterwards', async() => {
+  let socket
+  const late = []
+  const sql = postgres({
+    ...options,
+    max: 1,
+    onsocket: x => {
+      if (socket)
+        return
+      socket = x
+      const write = x.write
+      x.write = function(...args) {
+        x.destroyed && late.push(args[0])
+        return write.apply(this, args)
+      }
+    }
+  })
+  const err = await sql`select * from generate_series(1, 10)`.cursor(2, async() => {
+    socket.destroy()
+    await delay(20)
+  }).catch(e => e)
+  await delay(30)
+  const [{ x }] = await sql`select 1 as x`
+  await sql.end()
+  return ['CONNECTION_CLOSED,0,1', [err.code, late.length, x].join()]
+})
+
+t('Cursor callback rejection stays pending until ReadyForQuery arrives', async() => {
+  const server = await fakeServer()
+  const sql = postgres({ host: '127.0.0.1', port: server.port, max: 1 })
+  let settled = false
+  const cursor = sql`select x`.cursor(() => {
+    server.holdReady = true
+    throw new Error('boom')
+  }).catch(e => (settled = true, e.message))
+  await delay(50)
+  const pending = !settled && server.received.slice(-2).join('')
+  server.release()
+  const message = await cursor
+  await sql.end()
+  server.close()
+  return ['CS,boom', [pending, message].join()]
+})
+
+// A fake server speaking just enough of the protocol to script a cursor: every query yields one int4
+// column `x` with 3 rows (none for the array types lookup); with `holdReady` set, ReadyForQuery is
+// withheld until `release()`. `received` lists the message types in arrival order.
+function fakeServer() {
+  const msg = (type, ...parts) => {
+    const body = Buffer.concat(parts.map(x => typeof x === 'string' ? Buffer.from(x) : x))
+    const header = Buffer.alloc(5)
+    header.write(type)
+    header.writeInt32BE(body.length + 4, 1)
+    return Buffer.concat([header, body])
+  }
+  const int = (bytes, x) => {
+    const b = Buffer.alloc(bytes)
+    bytes === 2 ? b.writeInt16BE(x) : b.writeInt32BE(x)
+    return b
+  }
+  const ready = msg('Z', 'I')
+  const column = msg('T', int(2, 1), 'x\u0000', int(4, 0), int(2, 0), int(4, 23), int(2, 4), int(4, -1), int(2, 0))
+  const fake = { received: [], held: [], holdReady: false, release, close: () => server.close() }
+  const server = net.createServer(socket => {
+    const statements = {}
+    let buffer = Buffer.alloc(0)
+      , started = false
+      , rows = []
+
+    socket.on('data', x => {
+      buffer = Buffer.concat([buffer, x])
+      while (buffer.length >= (started ? 5 : 4)) {
+        const length = buffer.readInt32BE(started ? 1 : 0) + (started ? 1 : 0)
+        if (buffer.length < length)
+          break
+        started ? onmessage(String.fromCharCode(buffer[0]), buffer.slice(5, length)) : onstartup()
+        buffer = buffer.slice(length)
+      }
+    })
+
+    function onstartup() {
+      started = true
+      socket.write(Buffer.concat([msg('R', int(4, 0)), ready]))
+    }
+
+    function onmessage(type, body) {
+      fake.received.push(type)
+      const strings = body.toString().split('\u0000')
+      type === 'P' && (statements[strings[0]] = strings[1])
+      type === 'B' && (rows = /pg_type/.test(statements[strings[1]]) ? [] : ['1', '2', '3'])
+      type === 'P' && socket.write(msg('1'))
+      type === 'B' && socket.write(msg('2'))
+      type === 'D' && socket.write(column)
+      type === 'E' && execute(body.readInt32BE(body.indexOf(0) + 1))
+      type === 'C' && socket.write(msg('3'))
+      type === 'S' && (fake.holdReady ? fake.held.push(() => socket.write(ready)) : socket.write(ready))
+      type === 'X' && socket.end()
+    }
+
+    function execute(max) {
+      const batch = rows.splice(0, max || rows.length)
+      batch.forEach(x => socket.write(msg('D', int(2, 1), int(4, x.length), x)))
+      socket.write(rows.length ? msg('s') : msg('C', 'SELECT ' + batch.length + '\u0000'))
+    }
+  })
+
+  function release() {
+    fake.holdReady = false
+    fake.held.splice(0).forEach(fn => fn())
+  }
+
+  return new Promise(resolve => server.listen(0, '127.0.0.1', () =>
+    resolve(Object.assign(fake, { port: server.address().port }))
+  ))
+}
+
 t('Transform row', async() => {
   const sql = postgres({
     ...options,

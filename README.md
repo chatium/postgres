@@ -175,7 +175,7 @@ await sql`
 
 ```
 
-A single row will be returned by default, but you can also request batches by setting the number of rows desired in each batch as the first argument. That is usefull if you can do work with the rows in parallel like in this example:
+A single row will be returned by default, but you can also request batches by setting the number of rows desired in each batch as the first argument (an integer from 1 to 2147483647; any other value rejects the promise with `INVALID_CURSOR_ROWS` at once and nothing is sent). That is usefull if you can do work with the rows in parallel like in this example:
 
 ```js
 
@@ -190,9 +190,9 @@ await sql`
 
 ```
 
-If an error is thrown inside the callback function no more rows will be requested and the promise will reject with the thrown error, once the cursor's portal is closed.
+If an error is thrown inside the callback function no more rows will be requested and the promise will reject with the thrown value (whatever it is, even a falsy one), once the cursor's portal is closed.
 
-A server error received while the cursor is open (for example a `statement_timeout`, which counts the whole cursor as one statement) rejects the promise with that error instead of leaving it pending: no more rows are requested, also when it arrives while the callback is still running. A cursor inside `sql.begin()` runs on the transaction's connection, which is returned to the pool only when the transaction ends; a cursor outside a transaction holds its connection until it ends and then lets the queries queued behind it run.
+A server error received while the cursor is open (for example a `statement_timeout`, which counts the whole cursor as one statement) rejects the promise with that error instead of leaving it pending: no more rows are requested, also when it arrives while the callback is still running. A cursor inside `sql.begin()` runs on the transaction's connection, which is returned to the pool only when the transaction ends; a cursor outside a transaction holds its connection from the moment it is sent (also when it first waited for a free connection) until it ends and then lets the queries queued behind it run. When the connection fails (closed, destroyed, timed out) the promise rejects and a callback still running sends nothing more.
 
 You can also stop receiving any more rows early by returning an end token `sql.END` from the callback function.
 
@@ -601,7 +601,7 @@ This error is thrown if the connection was closed without an error. This should 
 ##### CONNECTION_ENDED
 > write CONNECTION_ENDED host:port
 
-This error is thrown if the user has called [`sql.end()`](#sql_end) and performed a query afterwards.
+This error is thrown if the user has called [`sql.end()`](#sql_end) and performed a query afterwards, or for a query that was still waiting for a free connection (all of them held by transactions or cursors) when that connection was released after `sql.end()`.
 
 ##### CONNECTION_DESTROYED
 > write CONNECTION_DESTROYED host:port
