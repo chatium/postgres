@@ -1374,6 +1374,28 @@ t('Cursor registered again once it was sent is rejected on its own and the runni
   }
 })
 
+t('Cursor registered on a pool-queued query once it was dispatched is rejected and the query runs plain', async() => {
+  const sql = postgres({ ...options, max: 1 })
+  let queued
+  await sql`select 1 as x`.cursor(() => {
+    // the cursor holds the only connection: this waits in the pool queue
+    queued = queued || sql`select * from generate_series(1, 3) as x`
+  })
+  // the cursor's end dispatched the queued query to the connection, which writes it only on the next
+  // tick: too late to turn it into a cursor that a competing begin() would then pipeline BEGIN behind
+  const rows = []
+  const late = queued.cursor(1, async({ x }) => (rows.push(x), await delay(5))).catch(e => e.code)
+  const tx = sql.begin(async sql => (await sql`select 2 as y`)[0].y).catch(e => e.code)
+  const result = await queued
+  const outcome = [await late, await tx]
+  const [{ z }] = await sql`select 3 as z`
+  await sql.end()
+  return [
+    'CURSOR_AFTER_SEND,2,1,2,3,,3',
+    outcome.concat(result.map(r => r.x), rows.join(), z).join()
+  ]
+})
+
 // A fake server speaking just enough of the protocol to script a cursor at exact points: every query
 // yields one int4 column `x` with the rows 1, 2, 3 (none for the array types lookup). Like PostgreSQL,
 // after an ErrorResponse (`error()` while a cursor waits, or `errorOnClose` in place of CloseComplete)
