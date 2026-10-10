@@ -190,7 +190,9 @@ await sql`
 
 ```
 
-If an error is thrown inside the callback function no more rows will be requested and the promise will reject with the thrown error.
+If an error is thrown inside the callback function no more rows will be requested and the promise will reject with the thrown error, once the cursor's portal is closed.
+
+A server error received while the cursor is open (for example a `statement_timeout`, which counts the whole cursor as one statement) rejects the promise with that error instead of leaving it pending: no more rows are requested, also when it arrives while the callback is still running. A cursor inside `sql.begin()` runs on the transaction's connection, which is returned to the pool only when the transaction ends; a cursor outside a transaction holds its connection until it ends and then lets the queries queued behind it run.
 
 You can also stop receiving any more rows early by returning an end token `sql.END` from the callback function.
 
